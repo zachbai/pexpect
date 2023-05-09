@@ -1,3 +1,4 @@
+import fcntl
 import os
 import sys
 import time
@@ -799,14 +800,12 @@ class spawn(SpawnBase):
         '''
 
         while data != b'' and self.isalive():
-            n = os.write(fd, data)
-            data = data[n:]
-
-    def __interact_read(self, fd):
-        '''This is used by the interact() method.
-        '''
-
-        return os.read(fd, 1000)
+            try:
+                n = os.write(fd, data)
+                data = data[n:]
+            except BlockingIOError:
+                return data
+        return data
 
     def __interact_copy(
         self, escape_character=None, input_filter=None, output_filter=None
@@ -814,44 +813,60 @@ class spawn(SpawnBase):
 
         '''This is used by the interact() method.
         '''
+        fcntl.fcntl(self.child_fd, fcntl.F_SETFL, os.O_NONBLOCK) 
 
+        read_data = b''
+        write_data = b''
         while self.isalive():
             if self.use_poll:
                 r = poll_ignore_interrupts([self.child_fd, self.STDIN_FILENO])
             else:
                 r, w, e = select_ignore_interrupts(
-                    [self.child_fd, self.STDIN_FILENO], [], []
+                    [self.child_fd, self.STDIN_FILENO], [self.STDOUT_FILENO,
+                        self.child_fd], []
                 )
             if self.child_fd in r:
                 try:
-                    data = self.__interact_read(self.child_fd)
+                    read_data = os.read(self.child_fd, 1000)
                 except OSError as err:
                     if err.args[0] == errno.EIO:
                         # Linux-style EOF
                         break
                     raise
-                if data == b'':
+                except BlockingIOError:
+                    print("Would have blocked reading from subshell")
+                    pass
+
+                if read_data == b'':
                     # BSD-style EOF
                     break
                 if output_filter:
-                    data = output_filter(data)
-                self._log(data, 'read')
-                os.write(self.STDOUT_FILENO, data)
+                    read_data = output_filter(read_data)
+                self._log(read_data, 'read')
+
+                n = os.write(self.STDOUT_FILENO, read_data)
+                read_data = read_data[n:]
+
             if self.STDIN_FILENO in r:
-                data = self.__interact_read(self.STDIN_FILENO)
+                write_data += os.read(self.STDIN_FILENO, 1000)
+
                 if input_filter:
-                    data = input_filter(data)
+                    write_data = input_filter(write_data)
                 i = -1
                 if escape_character is not None:
-                    i = data.rfind(escape_character)
+                    i = write_data.rfind(escape_character)
                 if i != -1:
-                    data = data[:i]
-                    if data:
-                        self._log(data, 'send')
-                    self.__interact_writen(self.child_fd, data)
+                    write_data = write_data[:i]
+                    if write_data:
+                        self._log(write_data, 'send')
+                    self.__interact_writen(self.child_fd, write_data)
                     break
-                self._log(data, 'send')
-                self.__interact_writen(self.child_fd, data)
+                self._log(write_data, 'send')
+                write_data = self.__interact_writen(self.child_fd, write_data)
+
+            if self.child_fd in w and len(write_data) > 0 :
+                write_data = self.__interact_writen(self.child_fd, write_data)
+
 
 
 def spawnu(*args, **kwargs):
